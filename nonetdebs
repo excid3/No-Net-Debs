@@ -1,0 +1,1192 @@
+#!/bin/bash
+#
+# Description: this script can list and download deb packages
+# for updates (dist-upgrade included) or new package(s) for 
+# a computer without Internet.
+#
+# By: Rui Bernardo
+#
+# Name: nonetdebs 
+# Version 0.128 - 2007.10.23
+#
+# Required on the computer with Internet:
+# bash
+# dialog
+# debootstrap
+# wget
+#
+# Required from the computer without Internet:
+# the file /var/lib/dpkg/status (usually less than 5 MB).
+#
+# To be run from another Linux box (LiveCD + USB pen?) with 
+# BASH and debootstrap installed and 200 MB plus the size 
+# of the downloads free space on a writable partition.
+#
+
+####################################################
+# Check functions
+####################################################
+
+function check_input {
+	# Check if no empty input or [Esc] pressed.
+	INPUT_BOX=$1
+	KEY_PRESSED=$2
+
+	if [ $KEY_PRESSED = 255 ]; then
+		dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "You pressed [Esc]." 0 0
+		CANCEL=0
+		return 1
+	elif [ -z $INPUT_BOX ]; then
+		# Empty input!
+		dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "You did not enter anything." 0 0
+		CANCEL=0
+		return 1
+	fi
+
+	return 0
+}
+
+function check_permissions {
+	# Check for write permissions
+	WHAT=$1
+	TYPE=$2
+
+	case $TYPE in
+		"DIR")
+			if [ ! -w "$WHAT" ]; then
+				# not writable
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "No write permissions in the directory $WHAT." 0 0
+				return 1
+			fi
+			;;
+		"FILE")
+			# strip dirname where is file
+			DIRNAME=`dirname "$WHAT"`
+			if [ ! -w "$DIRNAME" ]; then
+				# Directory where File is not writable
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "No write permissions in the directory $DIRNAME." 0 0
+				return 1
+			fi
+			if [ ! -w $WHAT ]; then
+				# File not writable
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "No write permissions to file $WHAT." 0 0
+				return 1
+			fi
+			;;
+	esac
+
+	return 0
+}
+
+function check_exists {
+	# check if file/dir exists
+	WHAT=$1
+	TYPE=$2
+	
+	case $TYPE in
+		"DIR")
+			[[ $WHAT != */ ]] && WHAT="$WHAT"/
+			if [ ! -d "$WHAT" ]; then
+				# dir doesn't exists
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "The directory $WHAT doesn't exist." 0 0
+				return 1
+			fi
+			;;
+		"FILE")
+			if [ ! -e $WHAT ]; then
+				# File doesn't exists
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "The file $WHAT doesn't exist." 0 0
+				return 1
+			fi
+
+			# strip dirname where is file
+			DIRNAME=`dirname "$WHAT"`
+			if [ ! -d "$DIRNAME" ]; then
+				# Directory doesn't exist
+				dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "The directory DIRNAME doesn't exist." 0 0
+				return 1
+			fi
+			;;
+	esac
+
+	return 0
+}
+
+
+####################################################
+# Work procedures
+####################################################
+
+####################################################
+# Which version of Ubuntu?
+####################################################
+
+function version {
+
+	SEL_VERSION=`dialog --stdout --item-help \
+	--title " No Net Debs - Version of Ubuntu " \
+	--menu "Please select the version of Ubuntu that is on the computer with no Internet connection." \
+	0 0 0 \
+	"Dapper" "Ubuntu 6.06 LTS Dapper Drake" "The computer with no Internet connection has Dapper installed." \
+	"Edgy" "Ubuntu 6.10 Edgy Eft" "The computer with no Internet connection has Edgy installed." \
+	"Feisty" "Ubuntu 7.04 Feity Fawn" "The computer with no Internet connection has Feisty installed." \
+	"Gutsy" "Ubuntu 7.10 Gutsy Gibbon" "The computer with no Internet connection installed."`
+
+	case $SEL_VERSION in 
+		"Dapper")
+			VERSION=dapper 
+			;;
+		"Edgy")
+			VERSION=edgy 
+			;;
+		"Feisty")
+			VERSION=feisty 
+			;;
+		"Gutsy")
+			VERSION=gutsy
+			dialog --stdout --aspect 12  --title " GUTSY: if debootstrap fails! " --trim --msgbox "If you are running an earlier version than Gutsy (Dapper/Edgy/Feisty), go to the folder /usr/lib/debootstrap/scripts/, make a backup copy of the original gutsy file and copy the feisty file to gutsy." 0 0 
+			;;
+		*)
+			dialog --stdout --aspect 12 --title " Exiting... " --trim --msgbox " Leaving..." 0 0
+			CANCEL=0
+			return 
+			;;
+	esac
+
+}
+
+
+####################################################
+# Select the mirror
+####################################################
+
+function select_mirror {
+	# dialog to select the mirror to create the chroot and/or for the repos (later).
+	MIRROR=`/usr/bin/dialog --stdout --aspect 9 --title " What mirror do you want to use? " --inputbox "What mirror should we use to download the chroot and/or download new packages? \n\n\
+You can select the nearest mirror (i.e. from your country) or use the default mirror (http://archive.ubuntu.com/ubuntu). \n\n\
+To use the nearest or national mirror, add the country domain in the beginning (us, es, fr, etc) on the mirror URL, i.e. \n\n\
+http://fr.archive.ubuntu.com/ubuntu \n\n\
+Please use an existing mirror." 0 0 "http://archive.ubuntu.com/ubuntu"`
+
+	LAST_KEY=$?
+	check_input "$MIRROR" "$LAST_KEY" || return
+
+}
+
+
+####################################################
+# Use an existing chroot
+####################################################
+
+function use_old_chroot {
+
+	# check if directory is valid chroot
+	if [ -d $FOLDER ]; then
+
+		if [ ! -e "$FOLDER"etc/issue ]; then 
+			dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "The directory $FOLDER is not a valid chroot. Leaving..." 0 0
+			return 
+		fi
+
+		CHROOT_VERSION=`cat "$FOLDER"etc/issue`
+
+	fi
+
+	# ask if we should use the existing chroot directory or create a new one
+	/usr/bin/dialog --stdout --title " Use existing directory? " --yesno "The directory $FOLDER already exists and seems to be a valid chroot. Do you want to use this chroot or do you want to delete it and create a new one? (a new chroot download and install will be made) \n\n\
+You can use the same chroot/debootstrap multiple times, as long the Ubuntu version is the same as the one that the chroot was created, i.e. existing chroot is \"Ubuntu 7.04\" and you want a \"Ubuntu 7.04\" chroot. \n\n\
+The directory $FOLDER has a chroot of \n\n\
+$CHROOT_VERSION \n\n\
+Press [Esc] to exit and select another directory later. \n\
+Select «Yes» to use the existing directory.\n\
+Select «No» to delete that directory and create a new chroot in this directory." 0 0
+	FOLDER_EXISTS_QUESTION=$?
+
+	case $FOLDER_EXISTS_QUESTION in
+		1)
+			# 1 - No, delete it
+			sudo rm -rfv "$FOLDER"
+			;;
+		0)
+			# 0 - Yes, lets keep it
+			NEW_CHROOT=0
+
+			# delete old files
+			if [ -e "$FOLDER"var/list_upgrades.txt ]; then
+				sudo rm "$FOLDER"var/list_upgrades.txt
+			fi
+			if [ -e "$FOLDER"var/new_packages.txt ]; then
+				sudo rm "$FOLDER"var/new_packages.txt
+			fi
+
+
+			return
+			;;
+		*)
+			# Esc, cancel and exit
+			dialog --stdout --aspect 12 --title " Exiting... " --trim --msgbox " Leaving..." 0 0
+			CANCEL=0
+			return 
+			;;
+	esac
+
+}
+
+
+####################################################
+# Create a chroot with debootstrap
+####################################################
+
+function create_chroot {
+
+	DELETE_CHROOT=0
+	NEW_CHROOT=1
+
+	# where do we create the chroot/debootstap directory? (for LiveCD/USB pens)
+	FOLDER=`/usr/bin/dialog --stdout --aspect 12 --cr-wrap --title " WRITABLE PARTITION/DIRECTORY " --inputbox "Please insert the directory of an existing chroot. If it doesn't exists, a new one will be created (~200 MB of disk space). If you are running from a LiveCD, input here the mountpoint of a USB stick/pen (usually in /media/) or a writable partition/directory on disk. Add the name of the directory to be created (nonetdebs by default). If you are running from disk, the default work directory is ~/nonetdebs/. Please insert the full path." 0 0 "$HOME/nonetdebs/"`
+	LAST_KEY=$?
+
+	check_input "$FOLDER" "$LAST_KEY" || return
+	[[ $FOLDER != */ ]] && FOLDER="$FOLDER"/
+	check_exists "$FOLDER" "DIR"
+	CHROOT_EXISTS=$?
+
+	if [[ $CHROOT_EXISTS = 0 ]] ; then
+		use_old_chroot
+		if [ $CANCEL = 0 ]; then
+			return
+		fi
+
+	fi
+
+	if [[ $NEW_CHROOT = 1 ]] ; then
+		
+		#select_mirror
+		if [ $CANCEL = 0 ]; then
+			return
+		fi
+
+		# NOTE: To make a debootstrap of Gutsy on Dapper/Edgy/Feisty, go to the directory
+		# /usr/lib/debootstrap/scripts/ and rename the file "gutsy" to "gutsy.original" 
+		# and copy the file "feisty" to "gutsy".
+
+		echo "Creating the chroot with debootstrap..."
+		sudo debootstrap $VERSION $FOLDER $MIRROR
+
+		# after creating the chroot, we need to delete the files in
+		# /var/cache/apt/archives/ so apt don't see them. if we don't,
+		# the chroot is created with lastest versions of those packages
+		# and apt will think they are available and nonetdebs will not
+		# add them to the list of files to download.
+		# (maybe instead of rm we should use mv, and then add them
+		# in the download directory. this would save some downloads.
+
+		# move downloaded packages to another directory, so they aren't visible to
+		# APT, thus making nonetdebs list them as needed downloads. if they stay there
+		# APT thinks they are available (they aren't on the other computer) and will not list 
+		# those packages.  To prevent duplicate downloads, they are ALL automatically moved
+		# to the download directory later, if user asks to download anything (upgrades or new
+		# packages - check download_upgrades).
+
+		sudo mkdir "$FOLDER"var/already_downloaded
+		sudo mv "$FOLDER"var/cache/apt/archives/*.deb "$FOLDER"var/already_downloaded/
+
+		# backup the newly created chroot/debootstrap? (usefull to avoid 
+		# downloading and install time if new chroot is needed)
+		/usr/bin/dialog --stdout --title " Backup the chroot/debootstrap? " --yesno "This is optional but it can be usefull if you don't wan't to download and install a new chroot/debootstrap again, if needed. It can save you from downloading a new chroot and its installation time." 0 0
+		BAK_QUESTION=$?
+
+		case $BAK_QUESTION in
+			0)
+				# 0 - Yes, backup
+
+				# where do we create the backup? (LiveCD/USB pens)
+				BAK_CHROOT_FILE=`/usr/bin/dialog --stdout --aspect 12 --cr-wrap --title " WRITABLE PARTITION/DIRECTORY " --inputbox "Where do you want to create the backup of the debootstrap/chroot (~200MB)? If you are running from a LiveCD, input here the mountpoint of a USB stick/pen (usually in /media/) or a writable partition on disk. Add the name of the working directory to be created (nonetdebs by default). If you are running from disk, the default work directory is ~/nonetdebs/. Please insert the full path. If a file with that name is found, no backup will be created and the existing one not be deleted." 0 0 "$HOME/nonetdebs_$VERSION.tgz"`
+
+				LAST_KEY=$?
+				check_input "$BAK_CHROOT_FILE" "$LAST_KEY" || return
+				check_exists "$BAK_CHROOT_FILE" "FILE"
+				BAK_EXISTS=$?
+
+				# there already is a backup, skip
+				if [ $BAK_EXISTS = 0 ]; then
+					dialog --aspect 12 --stdout --title " Backup exists " --trim --msgbox "A backup file with the name $BAK_CHROOT_FILE already exists. Skipping backup..." 0 0 ; return
+				fi
+
+				# create backup
+				#sudo tar -cvzf $BAK_CHROOT_FILE $FOLDER 
+				tar -cvzf $BAK_CHROOT_FILE $FOLDER 
+				dialog --aspect 12 --stdout --title " Backup created " --trim --msgbox "The backup file of the chroot/debootstrap was created in $BAK_CHROOT_FILE $FOLDER. To restore it, run \n\n\
+tar zxvf $BAK_CHROOT_FILE -C \n\n\
+Then run nonetdebs again and select the directory $FOLDER, then say «No» to delete this existing directory and proceed. On the Main Menu, select «Generate locale» to have a locale defined." 0 0
+				;;
+
+			1)
+				# 1 - No, skip
+				return 
+				;;
+			*)
+				# Esc, exit
+				dialog --stdout --aspect 12 --title " Exiting... " --trim --msgbox " Leaving..." 0 0
+				CANCEL=0
+				return 
+				;;
+		esac
+
+	fi
+}
+
+
+####################################################
+# Select locale.
+####################################################
+
+function select_locale {
+
+	# The locale defs are in the file /usr/share/i18n/SUPPORTED.
+	# it is a list with 2 fields in each line. The dialog --radiolist works 
+	# with "1 item off". We have to add double-quotes to the fields so 
+	# they can be the text in the selections in dialog, then " off \" 
+	# in the end of each "line" and a number in the beginning.
+	# in the end, we change the first off to on.
+
+	# the file used in the dialog
+	SEL_LOCALE_FILE="$FOLDER"var/locale_list
+	sudo cp "$FOLDER"usr/share/i18n/SUPPORTED $SEL_LOCALE_FILE
+
+	# write permissions
+	sudo chmod go+w $SEL_LOCALE_FILE
+
+	# add double-quotes in beginning of each line
+	sed 's/^/" /' $SEL_LOCALE_FILE > /tmp/tmp
+	sudo mv /tmp/tmp $SEL_LOCALE_FILE
+
+	# add "off" in the end of each line
+	sed 's/$/ " off \\/g' $SEL_LOCALE_FILE > /tmp/tmp
+	sudo mv /tmp/tmp $SEL_LOCALE_FILE
+
+	# add numbers in the beginning of the lines
+	sed = $SEL_LOCALE_FILE | sed 'N;s/\n/\ /' > /tmp/tmp
+	# mv do tmp de novo para $SEL_LOCALE_FILE
+	sudo mv /tmp/tmp $SEL_LOCALE_FILE
+
+	# change the first "off" to "on" to have a default selected.
+	# change 1 to the line number you prefer to have it has default.
+	sed '1 s/ off/ on/' $SEL_LOCALE_FILE > /tmp/tmp
+	sudo mv /tmp/tmp $SEL_LOCALE_FILE
+
+	# delete the last backslash.
+	#   count the number of lines in the file
+	NUM_LINES=`sed -n '$=' $SEL_LOCALE_FILE`
+	#   delete the \ in the line number $NUM_LINES (the last one)
+	sed  "$NUM_LINES s/\\\//" $SEL_LOCALE_FILE > /tmp/tmp
+	sudo mv /tmp/tmp $SEL_LOCALE_FILE
+
+	# create the option file of the dialog
+	DIALOG_FILE="$FOLDER"etc/dialog_options
+	sudo touch $DIALOG_FILE
+	sudo chmod go+w $DIALOG_FILE
+	sudo chmod +x $DIALOG_FILE
+
+	# using the dialog to select locale
+	echo "#/bin/bash" > $DIALOG_FILE
+	DIALOG_OPTIONS="/usr/bin/dialog --stdout --backtitle ' No Net Debs' --radiolist 'Which is the locale in the computer without Internet? If in doubt between UTF-8 and ISO on the same country, choose UTF-8 (Ubuntu default). Press [Space] and then [Enter] to select, [Escape] to cancel (no locale, no country definitions, no language packs, etc).' 0 0 0 \ "
+	echo $DIALOG_OPTIONS >> $DIALOG_FILE
+	cat $SEL_LOCALE_FILE >> $DIALOG_FILE
+
+	# select locale: run the dialog
+	SEL_LOCALE=`$DIALOG_FILE`
+
+	case $? in
+		255)
+			dialog --stdout --aspect 12 --title " Canceled... " --trim --msgbox "No locale generated. Leaving..." 0 0
+			CANCEL=0 
+			return
+			;;
+	esac
+
+	# read the content of the selected locale and save it to the file
+	# /etc/selected_locale inside $FOLDER.
+	SEL_LOCALE_TMP=`sed -n "$SEL_LOCALE"p $SEL_LOCALE_FILE`
+	echo "$SEL_LOCALE_TMP" > /tmp/tmp
+	SEL_LOCALE=`awk -F\" '{print $2}' /tmp/tmp`
+
+	# create the file /etc/selected_locale
+	SELECTED_LOCALE="$FOLDER"etc/selected_locale
+	sudo touch $SELECTED_LOCALE
+	sudo chmod go+w $SELECTED_LOCALE
+	echo "$SEL_LOCALE" > $SELECTED_LOCALE
+
+	# create a file to be executed inside of the
+	# chroot to generate the selected locale inside.
+	CREATE_LOCALE="$FOLDER"usr/local/sbin/create_locale
+	sudo touch $CREATE_LOCALE
+	sudo chmod go+w $CREATE_LOCALE
+	sudo chmod +x $CREATE_LOCALE
+	sudo echo "#/bin/bash" > $CREATE_LOCALE
+
+	sudo echo "CHARMAP="\`"awk  '{print "\$2" }' /etc/selected_locale"\`" " >> $CREATE_LOCALE
+	sudo echo "INPUTFILE1="\`"awk -F\. '{print "\$1"}' /etc/selected_locale"\`" " >> $CREATE_LOCALE
+	sudo echo "INPUTFILE2="\`"awk '{print "\$1"}' /etc/selected_locale"\`" " >> $CREATE_LOCALE
+
+	# generate locale
+	sudo echo "/usr/bin/localedef -f "\$CHARMAP" -i "\$INPUTFILE1" "\$INPUTFILE2"" >> $CREATE_LOCALE
+
+	# generate locale in chroot. we run the file $CREATE_LOCALE.
+	sudo chroot $FOLDER /usr/local/sbin/create_locale
+
+}
+
+
+####################################################
+# Repositories
+####################################################
+
+function select_repos {
+
+
+	echo "VERSION: " $VERSION
+
+	# create a new sources.list, avoids duplicate repositories if we run this again.
+	SOURCES_LIST_DIR="$FOLDER"etc/apt/
+	SOURCES_LIST_FILE="$FOLDER"etc/apt/sources.list
+	SOURCES_LIST_SOURCES="$FOLDER"etc/apt/sources.list.d
+
+	sudo chmod -R go+w $SOURCES_LIST_DIR
+	# delete sources.list
+	sudo rm $SOURCES_LIST_FILE
+
+	if [ -d $SOURCES_LIST_SOURCES ]; then
+		# sources.list.d directory exists
+		if [ -e $SOURCES_LIST_SOURCES/* ]; then
+			# remove sources.list.d directory
+			sudo rm $SOURCES_LIST_SOURCES/*
+		fi
+	elif [ ! -d $SOURCES_LIST_SOURCES ]; then
+		# create sources.list.d directory if it doesn't exist (dapper)
+		sudo mkdir $SOURCES_LIST_SOURCES
+	fi
+
+	sudo touch $SOURCES_LIST_FILE
+	sudo chmod -R go+w $SOURCES_LIST_DIR
+
+	SEL_REPOS=`dialog --stdout --backtitle " Repositories " --checklist 'Canonical and Medibuntu repos are not available for Gutsy at the moment.' 0 0 0 1 "Universe and multiverse" on 2 "Main and restricted" off 3 "Source" off 4 "Canonical Commercial" off 5 "Medibuntu" off `
+
+	# Universe e multiverse
+	if [[ $SEL_REPOS = *\"1\"* ]]
+	then
+		echo
+		sudo echo "deb $MIRROR $VERSION universe multiverse " >> $SOURCES_LIST_FILE
+		sudo echo "deb $MIRROR $VERSION-updates universe multiverse" >> $SOURCES_LIST_FILE
+		sudo echo "deb http://security.ubuntu.com/ubuntu $VERSION-security universe multiverse" >> $SOURCES_LIST_FILE
+
+		# src
+		if [[ $SEL_REPOS = *\"3\"* ]]
+		then
+		echo
+			sudo echo "deb-src $MIRROR $VERSION universe multiverse " >> $SOURCES_LIST_FILE
+			sudo echo "deb-src $MIRROR $VERSION-updates universe multiverse" >> $SOURCES_LIST_FILE
+			sudo echo "deb-src http://security.ubuntu.com/ubuntu $VERSION-security universe multiverse" >> $SOURCES_LIST_FILE
+		fi
+	fi
+
+	# Main e restricted
+	if [[ $SEL_REPOS = *\"2\"* ]]
+	then
+		echo
+		sudo echo "deb $MIRROR $VERSION main restricted" >> $SOURCES_LIST_FILE
+		sudo echo "deb $MIRROR $VERSION-updates main restricted" >> $SOURCES_LIST_FILE
+		sudo echo "deb http://security.ubuntu.com/ubuntu $VERSION-security main restricted" >> $SOURCES_LIST_FILE
+
+		#src
+		if [[ $SEL_REPOS = *\"3\"* ]]
+		then
+		echo
+			sudo echo "deb-src $MIRROR $VERSION main restricted" >> $SOURCES_LIST_FILE
+			sudo echo "deb-src $MIRROR $VERSION-updates main restricted" >> $SOURCES_LIST_FILE
+			sudo echo "deb-src http://security.ubuntu.com/ubuntu $VERSION-security main restricted" >> $SOURCES_LIST_FILE
+		fi
+	fi
+
+	# canonical
+	if [[ $SEL_REPOS = *\"4\"* ]]
+	then
+		# Canonical repos are diferent for gutsy
+		# for dapper/edgy/feisty
+		if [[ $VERSION != "gutsy" ]]; then
+			sudo echo "deb http://archive.canonical.com/ubuntu $VERSION-commercial main" >> $SOURCES_LIST_FILE
+		# for gutsy
+		else
+			sudo echo "deb http://archive.canonical.com/ubuntu $VERSION partner" >> $SOURCES_LIST_FILE
+		fi
+	fi
+
+	# third parties: medibuntu or another one - to change if necessary
+	# don't forget the keys of the repositories.
+	if [[ $SEL_REPOS = *\"5\"* ]]
+	then
+		THIRD_PARTIES="$FOLDER"usr/local/sbin/third_parties
+		sudo touch $THIRD_PARTIES
+		sudo chmod go+w $THIRD_PARTIES
+		sudo chmod +x $THIRD_PARTIES
+		sudo echo "#/bin/bash" > $THIRD_PARTIES
+		# wget não está no ubuntu-base 
+		sudo echo "apt-get update" >> $THIRD_PARTIES
+		sudo echo "apt-get install wget" >> $THIRD_PARTIES
+		# get the key
+		sudo echo "wget -c http://packages.medibuntu.org/medibuntu-key.gpg -O- | sudo apt-key add -" >> $THIRD_PARTIES
+		# get the file sources.list (to /etc/apt/sources.list.d/)
+		sudo echo "sudo wget -c http://www.medibuntu.org/sources.list.d/$VERSION.list -O /etc/apt/sources.list.d/medibuntu.list" >> $THIRD_PARTIES
+		sudo chroot $FOLDER /usr/local/sbin/third_parties
+	fi
+
+	update_apt
+
+}
+
+
+####################################################
+# Update APT with the selected repositories
+####################################################
+
+function update_apt {
+
+	APT_UPDATE="$FOLDER"usr/local/sbin/apt_update
+	sudo touch $APT_UPDATE
+	sudo chmod go+w $APT_UPDATE
+	sudo chmod +x $APT_UPDATE
+	sudo echo "#/bin/bash" > $APT_UPDATE
+	sudo echo "apt-get update" >> $APT_UPDATE
+
+	sudo chroot $FOLDER /usr/local/sbin/apt_update
+
+}
+
+
+####################################################
+# Which files are installed on the computer without Internet
+####################################################
+
+function installed_packages {
+	
+	IMPORT_STATUS_FILE=`/usr/bin/dialog --stdout --title " Where is the status file? " --inputbox "The status file is the file from the other computer that says which packages are installed in it. It is located in /var/lib/dpkg/status. Copy it to a CD or USB pen/stick (or any other media recognized here) and then input its location in the textbox below. Generally CDs and USBs are mounted in a sub-directory in /media/ (i.e. /media/disk/status)." 0 0 "$HOME/status"`
+
+	LAST_KEY=$?
+
+	check_input "$IMPORT_STATUS_FILE" "$LAST_KEY"
+	check_exists "$IMPORT_STATUS_FILE" "FILE" 
+
+	echo "$FOLDER"var/lib/dpkg/status
+	ls -l "$FOLDER"var/lib/dpkg/status
+	sudo cp $IMPORT_STATUS_FILE "$FOLDER"var/lib/dpkg/status
+
+}
+
+
+####################################################
+# List upgrades/dist-upgrade files
+####################################################
+
+function list_upgrades {
+
+	# dist-upgrade or just upgrade?
+
+	UPGRADE_LEVEL=`dialog --stdout --item-help \
+	--title " No Net Debs - upgrade or dist-upgrade? " \
+	--menu "Do you want to run a simple upgrade or a dist-upgrade?\n\n\An upgrade will update all the packages (at least, the ones that have an update available) you have installed on the other computer. A dist-upgrade will update all the packages like upgrade does, but will also upgrade to the next release version of Ubuntu available on the repositories. Usually update-manager in Ubuntu Desktop only runs an normal update (not dist-upgrade). So, you should not need to do a dist-upgrade unless you know what you are doing." \
+	0 0 0 \
+	"Upgrade" "Update all the packages in the other computer (recommended)." "Usually update-manager in Ubuntu Desktop only runs an update." \
+	"Dist-upgrade" "Update all the packages and also upgrade to the next Ubuntu release on repositories." "You should not need to do a dist-upgrade unless you know what you are doing."`
+
+	case $UPGRADE_LEVEL in 
+		"Upgrade")
+			LEVEL="upgrade"
+			;;
+		"Dist-upgrade")
+			LEVEL="dist-upgrade"
+			;;
+		*)
+			dialog --stdout --aspect 12 --title " Canceled... " --trim --msgbox " Returning to main menu..." 0 0
+			CANCEL=0
+			return 
+			;;
+	esac
+
+	LIST_UPGRADES="$FOLDER"usr/local/sbin/list_upgrades
+	sudo touch $LIST_UPGRADES
+	sudo chmod go+w $LIST_UPGRADES
+	sudo chmod +x $LIST_UPGRADES
+	sudo echo "#/bin/bash" > $LIST_UPGRADES
+	#sudo echo "rm /var/cache/apt/archives/*.deb" > $LIST_UPGRADES
+	sudo echo "apt-get update" >> $LIST_UPGRADES
+
+	sudo echo "apt-get -u -qq --print-uris $LEVEL | awk -F\' '{ print "\$2" }' > /var/list_upgrades.txt" >> $LIST_UPGRADES
+
+	sudo chroot $FOLDER /usr/local/sbin/list_upgrades
+
+
+	# dialogs displaying where is the file list and to show the list of downloads.
+	LIST_TEXT_FILE="$FOLDER"var/list_upgrades.txt
+
+	# count number of upgrades available
+	NUM_UPGRADES=`sed -n '$=' $LIST_TEXT_FILE`
+
+	dialog --aspect 12 --stdout --title " List: $LIST_TEXT_FILE " --trim --msgbox "There are $NUM_UPGRADES packages available for $LEVEL.\n\n\
+The list of files to download is stored in the file\n\n\
+$LIST_TEXT_FILE\n\n\
+Press Enter to see it." 0 0
+
+	dialog --stdout --title " List: $LIST_TEXT_FILE " --textbox "$LIST_TEXT_FILE" 0 0
+
+	dialog --aspect 12 --stdout --title " Size of the downloads " --msgbox "To see the size of the download, choose «Advanced - chroot» on the main menu and inside the chroot/debootstrap type «apt-get upgrade» or «apt-get dist-upgrade» (for release upgrade). In the end of the list, you will see the size of the download. Press «n» (NO) to NOT perform the upgrade.\n\n\
+Type «exit» to return from/exit the chroot environment. DO NOT ACTUALLY UPGRADE OR INSTALL ANYTHING UNLESS YOU KNOW WHAT YOUR DOING...\n\n\
+This is just the list. To actually download these packages, go to the «Download» menu." 0 0
+}
+
+
+####################################################
+# New packages files
+####################################################
+
+function new_packages {
+
+	# inputbox which packages to install (apt-get install).
+	WHICH_PACKAGES=`/usr/bin/dialog --stdout --aspect 12 --title " Install new package " --inputbox "Which packages you want to install on the computer without Internet? You can put here various packages just as you would in apt-get" 0 0 ""`
+
+	LAST_KEY=$?
+	check_input "$FOLDER" "$LAST_KEY" || return
+
+	NEW_PACKAGES="$FOLDER"usr/local/sbin/new_packages
+	sudo touch $NEW_PACKAGES
+	sudo chmod go+w $NEW_PACKAGES
+	sudo chmod +x $NEW_PACKAGES
+	sudo echo "#/bin/bash" > $NEW_PACKAGES
+	sudo echo "apt-get update" >> $NEW_PACKAGES
+
+	# install updated packages?
+	/usr/bin/dialog --stdout --title " Install upgraded packages? " --yesno "If you answer yes, the newest versions will be installed, and eventually upgrade some of the already installed packages. This will result in bigger download and greater number of files to download. Choose «No» if you only want to install a new package (maybe not the newest version) without upgrading anything else." 0 0
+
+	case $? in
+		0)
+			# 0 - Yes, newest/ugraded ones
+			sudo echo "apt-get -qq --print-uris install $WHICH_PACKAGES | awk -F\' '{ print "\$2" }' > /var/new_packages.txt" >> $NEW_PACKAGES 
+			;;
+		1)
+			# 1 - No, keep existing ones
+			sudo echo "apt-get -qq --print-uris install $WHICH_PACKAGES --no-upgrade | awk -F\' '{ print "\$2" }' > /var/new_packages.txt" >> $NEW_PACKAGES 
+			;;
+		*)
+			dialog --stdout --aspect 12 --title " Canceled... " --trim --msgbox " Returning to main menu." 0 0 
+			CANCEL=0
+			return
+			;;
+	esac
+
+	sudo chroot $FOLDER /usr/local/sbin/new_packages
+
+	# dialogs displaying where is the file list and to show the list of downloads.
+	LIST_TEXT_FILE="$FOLDER"var/new_packages.txt
+
+
+	# count number of packages to be downloaded
+	NUM_PACKAGES=`sed -n '$=' $LIST_TEXT_FILE`
+
+	dialog --aspect 12 --stdout --title " List: $LIST_TEXT_FILE " --trim --msgbox "You need to download $NUM_PACKAGES packages to install $WHICH_PACKAGES.\n\n\
+The list of files to download is stored in the file\n\n\
+$LIST_TEXT_FILE\n\n\
+Press Enter to see it" 0 0
+
+	dialog --stdout --title " List: $LIST_TEXT_FILE " --textbox "$LIST_TEXT_FILE" 0 0
+
+	dialog --aspect 12 --stdout --title " Size of the download " --msgbox "To see the size of the download, on the main menu, choose «Advanced - chroot» and inside the chroot/debootstrap run «apt-get install $WHICH_PACKAGES». Add the option «--no-upgrade» if you selected it. In the end of the list, you can see the size of the download. Press «n» (NO) to NOT perform the install. Type «exit» to return from/exit the chroot environment. DO NOT INSTALL ANYTHING UNLESS YOU KNOW WHAT YOUR DOING... \n\n\
+This is just the list. To actually download these packages, go to the «Download» menu." 0 0
+}
+
+
+####################################################
+# Creates a script to scan packages and add repo
+####################################################
+
+function add_nonetrepo_script {
+	# this will create a script on the directory where the files
+	# were downloaded. the script will be named "nonetrepo".
+	# execute it to add the new repository
+	SCRIPT_SCAN_ADD=$DL_FOLDER"nonetrepo"
+	touch $SCRIPT_SCAN_ADD
+	chmod +x $SCRIPT_SCAN_ADD
+	echo "#!/bin/bash" > $SCRIPT_SCAN_ADD
+	echo "# check what is the actual directory" >> $SCRIPT_SCAN_ADD
+	echo "CURRENT_DIR=\`pwd\`" >> $SCRIPT_SCAN_ADD
+	echo "CURRENT_DIR_SLASH=\"\$CURRENT_DIR\"/" >> $SCRIPT_SCAN_ADD
+	echo "ERROR=\$?" >> $SCRIPT_SCAN_ADD
+	echo "echo \"\$ERROR\"" >> $SCRIPT_SCAN_ADD
+	echo "if [[ \"\$ERROR\" != 0 ]] ; then" >> $SCRIPT_SCAN_ADD
+	echo "	exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "echo \$CURRENT_DIR" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+
+	# if dpkg-dev is to be installed
+	# add the installation of those packages to the nonetrepo script
+	if [ -e "$FOLDER"var/dpkg_dev_install.txt ]; then
+		echo "# install dpkg-dev package and dependencies which" >> $SCRIPT_SCAN_ADD
+		echo "# are needed to install dpkg-scanpackages." >> $SCRIPT_SCAN_ADD
+		while read LINE
+		do
+			PKG_NAME=`expr $LINE : '.*/\(.*\)' '|' $LINE`
+			echo "sudo dpkg -i $PKG_NAME" >> $SCRIPT_SCAN_ADD
+		done < "$FOLDER"var/dpkg_dev_install.txt
+	fi
+
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# check if directory is writable to create Packages.gz" >> $SCRIPT_SCAN_ADD
+	echo "if [ ! -w \$CURRENT_DIR ]; then" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"PERMISSIONS ERROR.\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"Cannot write here, please copy all this files to disk or other writable media,\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"then go to that directory and type:\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo  " >> $SCRIPT_SCAN_ADD
+	echo "   echo \"./nonetrepo\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo  " >> $SCRIPT_SCAN_ADD
+	echo "   exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# check if there are any *.deb file in directory" >> $SCRIPT_SCAN_ADD
+	echo "if [ ! \"\$(ls \"\$CURRENT_DIR_SLASH\"*.deb)\" ]; then" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"Error: no deb files found in this directory.\"" >> $SCRIPT_SCAN_ADD
+	echo "   exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# all seems ok, scan packages" >> $SCRIPT_SCAN_ADD
+	echo "dpkg-scanpackages . /dev/null | gzip > ./Packages.gz" >> $SCRIPT_SCAN_ADD
+	echo "ERROR="\$?"" >> $SCRIPT_SCAN_ADD
+	echo "# check if dpkg-scanpackages exited without errors" >> $SCRIPT_SCAN_ADD
+	echo "echo "\$ERROR"" >> $SCRIPT_SCAN_ADD
+	echo "if [[ "\$ERROR" != 0 ]];then" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"Error while scanning packages.\"" >> $SCRIPT_SCAN_ADD
+	echo "   exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# ask if sources.list is to be changed" >> $SCRIPT_SCAN_ADD
+	echo "read -p \"Do you want to change the sources.list file in this computer? (Y/N) \" -e YESNO" >> $SCRIPT_SCAN_ADD
+	echo "	echo \$YESNO" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "if ! [  \$YESNO = "Y" -o \$YESNO = \"y\" ]; then" >> $SCRIPT_SCAN_ADD
+	echo "   echo" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"Not changing /etc/apt/sources.list. To do it yourself, add\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo " >> $SCRIPT_SCAN_ADD
+	echo "   echo \"deb file:\$CURRENT_DIR /\"" >> $SCRIPT_SCAN_ADD
+	echo "   echo " >> $SCRIPT_SCAN_ADD
+	echo "   echo \"in the first line.\"" >> $SCRIPT_SCAN_ADD
+	echo "   exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# check if sources.list exists" >> $SCRIPT_SCAN_ADD
+	echo "if [ ! -e /etc/apt/sources.list ]; then" >> $SCRIPT_SCAN_ADD
+	echo "   echo \"Error. Can't find the file /etc/apt/sources.list.\"" >> $SCRIPT_SCAN_ADD
+	echo "   exit" >> $SCRIPT_SCAN_ADD
+	echo "fi" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+	echo "# add new repository in sources.list" >> $SCRIPT_SCAN_ADD
+	echo "sudo -k; sudo -K" >> $SCRIPT_SCAN_ADD
+	echo "echo \"Please enter your sudo password to change the file.\"" >> $SCRIPT_SCAN_ADD
+	echo "sudo mv /etc/apt/sources.list /etc/apt/sources.list.nonetrepo" >> $SCRIPT_SCAN_ADD
+	echo "sudo touch /etc/apt/sources.list" >> $SCRIPT_SCAN_ADD
+	echo "sudo chmod o+w /etc/apt/sources.list" >> $SCRIPT_SCAN_ADD
+	echo "sudo echo \"deb file:\$CURRENT_DIR /\" > /etc/apt/sources.list" >> $SCRIPT_SCAN_ADD
+	echo "sudo cat /etc/apt/sources.list.nonetrepo >> /etc/apt/sources.list" >> $SCRIPT_SCAN_ADD
+	echo "sudo chmod o-w /etc/apt/sources.list" >> $SCRIPT_SCAN_ADD
+	echo "echo \"Done. Now update your repositories to be able to install/upgrade packages from here.\"" >> $SCRIPT_SCAN_ADD
+	echo "" >> $SCRIPT_SCAN_ADD
+
+}
+
+
+####################################################
+# Copy files that upgrade_list.txt wants and we already have
+####################################################
+
+function copy_packages {
+	# when the chroot is built, debootstrap downloads over 150 files,
+	# many of them (around 60) are usually needed to an upgrade of
+	# a not updated system. This verifies if we have these files in
+	# /var/already_downloaded and copies them to the $DL_FOLDER, if they 
+	# still aren't there. Then wget will find them and will not download them.
+
+	PACKAGES_LIST=$FOLDER"var/list_upgrades.txt"
+	NUM_PACKAGES_FOUND=0
+	NUM_PACKAGES_COPIED=0
+
+	echo "Looking for already downloaded packages in "$FOLDER"var/already_downloaded and not in $DL_FOLDER."
+
+	while read LINE
+	do
+		PKG_NAME=`expr $LINE : '.*/\(.*\)' '|' $LINE`
+		PKG_ALREADY="$FOLDER""var/already_downloaded/""$PKG_NAME"
+		PKG_DL_FOLDER="$DL_FOLDER""$PKG_NAME"
+		# if packages is found in $FOLDER/var/already_downloaded
+		if [ -e "$PKG_ALREADY" ]; then
+			# and if package is not in $DL_FOLDER then copy it
+			NUM_PACKAGES_FOUND=`expr $NUM_PACKAGES_FOUND + 1`
+			if [ ! -e "$PKG_DL_FOLDER" ]; then
+				echo "Found $PKG_ALREADY"
+				cp "$PKG_ALREADY" "$DL_FOLDER"
+				NUM_PACKAGES_COPIED=`expr $NUM_PACKAGES_COPIED + 1`
+			fi
+		fi
+	done < "$PACKAGES_LIST"
+
+	if [ $NUM_PACKAGES_COPIED = 0 ]; then
+		echo "No packages needed to be copied."
+	elif [ ! $NUM_PAKAGES_FOUND = 0 ]; then
+		echo "Found that $NUM_PACKAGES_FOUND packages were in "$FOLDER"var/already_downloaded but they existed in $DL_FOLDER too."
+	else
+		echo "Copied $NUM_PACKAGES_COPIED package(s) that were listed in $PACKAGES_LIST, were not in $DL_FOLDER and were in "$FOLDER"var/already_downloaded."
+		if [ ! $NUM_PACKAGES_FOUND = 0 ]; then
+			echo "Also found $NUM_PACKAGES_FOUND that were in "$FOLDER"var/already_downloaded, but already were in $DL_FOLDER too."
+		fi
+	fi
+	
+}
+
+
+####################################################
+# Check if dpkg-dev is installed on the other computer
+####################################################
+
+function check_dpkg_dev {
+	SCRIPT_DPKG_DEV_CHK="$FOLDER"usr/local/sbin/dpkg_dev_chk
+	sudo touch $SCRIPT_DPKG_DEV_CHK
+	sudo chmod go+w $SCRIPT_DPKG_DEV_CHK
+	sudo chmod +x $SCRIPT_DPKG_DEV_CHK
+
+	sudo touch "$FOLDER"var/is_dpkg_dev_installed.txt
+	sudo chmod go+w "$FOLDER"var/is_dpkg_dev_installed.txt
+
+	echo "#!/bin/bash" > $SCRIPT_DPKG_DEV_CHK
+	echo "# check if dpkg-dev is installed on the other computer" >> $SCRIPT_DPKG_DEV_CHK
+	echo "dpkg --get-selections|grep dpkg-dev > /var/is_dpkg_dev_installed.txt" >> $SCRIPT_DPKG_DEV_CHK
+
+	sudo chroot $FOLDER /usr/local/sbin/dpkg_dev_chk
+
+}
+
+
+####################################################
+# print-uris to install dpkg-dev in target
+####################################################
+function install_dpkg_dev {
+	INST_DPKG_DEV="$FOLDER"usr/local/sbin/inst_dpkg_dev
+	sudo touch $INST_DPKG_DEV
+	sudo chmod go+w $INST_DPKG_DEV
+	sudo chmod +x $INST_DPKG_DEV
+	sudo echo "#/bin/bash" > $INST_DPKG_DEV
+
+	sudo echo "apt-get -qq --print-uris install dpkg-dev | awk -F\' '{ print "\$2" }' > /var/dpkg_dev_install.txt" >> $INST_DPKG_DEV
+
+	echo "No dpkg-dev package on target. Adding it."
+	sudo chroot $FOLDER /usr/local/sbin/inst_dpkg_dev
+
+}
+
+
+####################################################
+# Download upgrade files
+####################################################
+
+function download_upgrades {
+
+	# check if file list (upgrades or new packages) exists, out
+	if [ ! -e "$FOLDER"var/list_upgrades.txt -a ! -e "$FOLDER"var/new_packages.txt ]; then
+		dialog --aspect 12 --stdout --title " No download list created! " --trim --msgbox "You did not create a download list! To create a list of the files to download, go to «Upgrade/dist-upgrade» or «Install new package» in the main menu." 0 0
+		return
+	fi
+
+	# in which directory we're going to save the files.
+	DL_FOLDER=`/usr/bin/dialog --stdout --aspect 12 --cr-wrap \
+	--title "WRITABLE PARTITION/DIRECTORY" \
+	--inputbox "Where do you want to save the files? If you are \
+running from a LiveCD, input here the mount point of a USB stick/pen or a \
+writable partition on disk. Add the name of the directory to save the files (packages). \
+If you are running from disk, the default directory is $HOME/packages/." \
+	0 0 "$HOME/packages/"`
+
+	LAST_KEY=$?
+	check_input "$DL_FOLDER" "$LAST_KEY" || return
+	[[ $DL_FOLDER != */ ]] && DL_FOLDER="$DL_FOLDER"/
+
+	# check if directory exists and creates one if not
+	if [ ! -d "$DL_FOLDER" ]; then
+		mkdir "$DL_FOLDER"
+		check_permissions "$DL_FOLDER" "DIR" || return
+		dialog --aspect 12 --stdout --title " Created new directory " --trim --msgbox "The directory $DL_FOLDER was created.\n\n\
+Proceeding with the download." 0 0
+	else
+		check_permissions "$DL_FOLDER" "DIR" || return
+	fi
+
+	# check if dpkg-dev (dpkg-scanpakages) is installed on the other computer
+	check_dpkg_dev
+
+	IS_DPKG_DEV_INST=`cat "$FOLDER"var/is_dpkg_dev_installed.txt`
+
+	echo $IS_DPKG_DEV_INST
+
+	# if "$FOLDER"var/is_dpkg_dev_instaled.txt have "install" inside
+	if [[ $IS_DPKG_DEV_INST != "dpkg-dev					install" ]]; then
+		# create script to download the dpkg-dev dependecies
+		# then download them.
+		install_dpkg_dev
+	fi
+
+	# download all packages on the lists (upgrades and new packages), but 
+	# do not download already downloaded packages (wget -nc option)
+	echo ""
+	echo "Beginning to download the rest of the packages."
+	echo ""
+	if [ -e "$FOLDER"var/list_upgrades.txt ]; then
+		# before we start downloading upgrades (only upgrades, not new packages), 
+		# we copy the packages that were downloaded while the chroot was created. 
+		# wget will not download them (again) if they already are in the directory.
+		# this saves the download of already downloaded packages.
+		copy_packages
+
+		echo ""
+		echo "Download updates packages."
+		echo ""
+
+		wget -nc -c -i "$FOLDER"var/list_upgrades.txt -P $DL_FOLDER
+	fi
+	if [ -e "$FOLDER"var/new_packages.txt ]; then
+		echo ""
+		echo "Download new packages."
+		echo ""
+		wget -nc -c -i "$FOLDER"var/new_packages.txt -P $DL_FOLDER
+	fi
+	if [ -e "$FOLDER"var/dpkg_dev_install.txt ]; then
+		# also download dpkg-dev packages
+		echo ""
+		echo "Download dpkg-dev packages."
+		echo ""
+		wget -nc -c -i "$FOLDER"var/dpkg_dev_install.txt -P $DL_FOLDER
+	fi
+
+	# add the script to create repository Packages.gz in the other computer
+	echo ""
+	echo "Creating the nonetrepo script in $DL_FOLDER"
+	echo ""
+	add_nonetrepo_script
+
+	dialog --aspect 12 --stdout --title " List of files downloaded " --trim --msgbox "The downloaded packages are stored in: \n\n\
+$DL_FOLDER \n\n\
+You can add more packages to this directory (upgrades or new packages). After that, you can create an ISO file with them and burn it to a CD-ROM. Go to the main menu of this script to create an ISO file. \n\n\
+Please note that you don't need to create a ISO file and burn a CD if you use a USB Memory pen/stick. Just plug it on the other computer, run the \"nonetrepo\" script (in the directory where the packages are) and then update your APT (Synaptic/apt-get) so it can find your new packages." 0 0
+
+}
+
+
+####################################################
+# Create an ISO with the files.
+####################################################
+
+function create_iso {
+
+	DL_FOLDER="$HOME/packages/"
+
+	ISO_DL_FOLDER=`/usr/bin/dialog --stdout --aspect 12 --cr-wrap --title " Create ISO file " --inputbox "Where did you saved the downloaded files? The default directory is $HOME/packages/." 0 0 "$DL_FOLDER"`
+
+	LAST_KEY=$?
+	check_input "$ISO_DL_FOLDER" "$LAST_KEY" || return
+	[[ $ISO_DL_FOLDER != */ ]] && ISO_DL_FOLDER="$ISO_DL_FOLDER"/
+	check_exists "$ISO_DL_FOLDER" "DIR" || return
+	check_permissions "$ISO_DL_FOLDER" "DIR" || return
+
+	SAVE_ISO=`/usr/bin/dialog --stdout --aspect 12 --cr-wrap --title " Where do you want to create the ISO file? " --inputbox "Select a writable partition, media or directory to save the ISO file. Please include its name (i.e /media/disk/downloads.iso or $HOME/upgrades.iso). The ISO file will have the size of the downloaded files." 0 0 "$HOME/upgrades.iso"`
+
+	LAST_KEY=$?
+	check_input "$SAVE_ISO" "$LAST_KEY" || return
+
+	# check if the ISO file exist, overwrite?
+	check_exists "$SAVE_ISO" "FILE"
+	ISO_EXISTS=$?
+
+	if [ $ISO_EXISTS = 0 ]; then
+		# check write permission
+
+		ISO_DIRNAME=`dirname "$SAVE_ISO"`
+		if [ ! -w "$ISO_DIRNAME" ]; then
+			# Directory where File is not writable
+			dialog --stdout --aspect 12 --title " ERROR " --trim --msgbox "Don't have permissions to write in the directory $ISO_DIRNAME." 0 0
+			return
+		fi
+
+		/usr/bin/dialog --stdout --title " File exists " --yesno "The file $SAVE_ISO exists. Do you want to overwrite it?" 0 0
+		ISO_EXISTS_QUESTION=$?
+
+		case $ISO_EXISTS_QUESTION in
+			1)
+				# 1 - No
+				return
+				;;
+			0)
+				# 0 - Yes
+				rm $SAVE_ISO
+				;;
+			*)
+				# Esc, cancel and exit
+				dialog --stdout --aspect 12 --title " Canceled... " --trim --msgbox " Return to menu..." 0 0
+				return
+				;;
+		esac
+
+	fi
+
+	mkisofs -f -R -J -r -l -v -A "Ubuntu Updates `date +%Y%m%d`" -o $SAVE_ISO $ISO_DL_FOLDER
+
+	# check if the ISO file was created
+	check_exists "$SAVE_ISO" "FILE"
+
+	ISO_EXISTS=$?
+	echo $ISO_EXISTS
+
+	if [ $ISO_EXISTS = 1 ]; then
+		dialog --stdout --aspect 12  --title " ERROR " --trim --msgbox "There was an error while creating the ISO file \n\
+$SAVE_ISO \n\
+doesn't exists. Please check if you have write permissions on that location. Press a key to return to the main menu." 0 0
+		return
+		
+	fi
+
+	dialog --aspect 12 --stdout --title " SUCCESS: ISO file created " --trim --msgbox "The downloaded packages are stored in the file: \n\n\
+$SAVE_ISO \n\n\
+Burn it on a CD/DVD. Once you put the CD on the drive of the other computer, copy the files to a directory in hardisk and run the script \"nonetrepo\" from that directory. Then update APT (Synaptic, apt-get) and update/upgrade/install the packages." 0 0
+
+}
+
+
+####################################################
+# Advanced: chroot to debootstrap
+####################################################
+
+function advanced_chroot {
+
+	echo "WARNING: you are going to the chroot environment!"
+	echo "DO NOT INSTALL OR UPGRADE ANYTHING UNLESS YOU REALLY KNOW WHAT YOU ARE DOING :S"
+	echo "Type «exit» to return."
+	sudo chroot $FOLDER
+}
+
+
+####################################################
+# Setup a new chroot
+####################################################
+
+function setup_new_chroot {
+
+	CANCEL=1
+	NEW_CHROOT=1
+
+	# Ubuntu version on computer without Internet
+	version
+	if [ $CANCEL = 0 ]; then
+		return
+	fi
+
+	# Ubuntu mirror
+	select_mirror
+	if [ $CANCEL = 0 ]; then
+		return
+	fi
+
+	# Select the mirror and create chroot with debootstrap
+	create_chroot
+	if [ $CANCEL = 0 ]; then
+		return
+	fi
+
+	# If a new chroot was created, set its locale & repos
+	if [ $NEW_CHROOT = 1 ]; then
+		select_locale
+		if [ $CANCEL = 0 ]; then
+			return
+		fi
+	
+		# Select repositories
+		select_repos
+		if [ $CANCEL = 0 ]; then
+			return
+		fi
+
+	fi
+	# copy status file
+	installed_packages
+	if [ $CANCEL = 0 ]; then
+		return
+	fi
+
+}
+
+####################################################
+# Menus
+####################################################
+
+####################################################
+# The main menu
+####################################################
+
+EXIT_MENU=0
+
+setup_new_chroot
+
+while [ "$EXIT_MENU" != 1 ]
+do
+	MAIN_MENU=`dialog --stdout --item-help \
+--title " No Net Debs - Internet and chroot menu " \
+--menu "The chroot is like your computer with no Internet here. After you copy the status file, the chroot will «know» which files you have installed there and tell you which files to download and upgrade." \
+0 0 0 \
+"Exit" "Exit No Net Debs" "You're done here, going to the other computer..." \
+"Directory" "Create or select a chroot" "Select or create a chroot directory with the Ubuntu version of the other computer." \
+"Locale" "Generate locale in chroot" "Select the locale as it is on the other computer." \
+"Sources" "Change sources.list" "Select the repositories from where you want to get packages." \
+"Status" "Copy the status file to the chroot" "Copy the file /var/lib/dpkg/status from the computer with no Internet." \
+"Upgrade" "Make a upgrade/dist-upgrade" "Create list of files needed to make a upgrade/dist-upgrade on the other computer." \
+"Install" "Install new package" "Create list of files needed to install new package(s) on the other computer." \
+"Download" "Download the files you selected previously" "Download all the files you selected to a directory." \
+"ISO" "Create ISO file" "Create an ISO file to burn later with files you downloaded." \
+"Advanced" "Advanced - chroot" "chroot into the chroot. For advanced users. Be careful with what you do!"`
+
+	case $MAIN_MENU in 
+		"Exit")
+			exit 
+			;;
+		"Directory")
+			setup_new_chroot 
+			;;
+		"Locale")
+			select_locale 
+			;;
+		"Sources")
+			select_repos 
+			;;
+		"Status")
+			installed_packages 
+			;;
+		"Upgrade")
+			list_upgrades 
+			;;
+		"Install")
+			new_packages 
+			;;
+		"Download")
+			download_upgrades 
+			;;
+		"ISO")
+			create_iso 
+			;;
+		"Advanced")
+			advanced_chroot 
+			;;
+	esac
+
+done
+
+# EOF
